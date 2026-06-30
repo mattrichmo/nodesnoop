@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Find and manage running Node.js processes from the terminal or macOS menu bar.",
   "type": "module",
+  "homepage": "https://github.com/mattrichmo/nodesnoop#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/mattrichmo/nodesnoop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mattrichmo/nodesnoop/issues"
+  },
   "bin": {
     "nodesnoop": "bin/nodesnoop.js"
   },
