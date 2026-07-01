@@ -10,6 +10,40 @@ struct NodeProcess {
     let args: String
 }
 
+struct ProcessDisplay {
+    let process: NodeProcess
+    let cwd: String?
+    let projectRoot: String?
+    let projectName: String
+    let framework: String
+    let commandSummary: String
+    let ports: [Int]
+
+    var isLocalhostProject: Bool {
+        return !ports.isEmpty
+    }
+
+    var primaryURL: String? {
+        guard let port = ports.first else {
+            return nil
+        }
+
+        return "http://localhost:\(port)"
+    }
+}
+
+final class ProcessMenuPayload: NSObject {
+    let pid: Int
+    let cwd: String?
+    let url: String?
+
+    init(pid: Int, cwd: String?, url: String?) {
+        self.pid = pid
+        self.cwd = cwd
+        self.url = url
+    }
+}
+
 func runCommand(_ executable: String, _ arguments: [String]) -> String? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
@@ -100,6 +134,282 @@ func processCwd(pid: Int) -> String? {
         .map { String($0.dropFirst()) }
 }
 
+func processCwdsByPID(_ pids: [Int]) -> [Int: String] {
+    guard !pids.isEmpty else {
+        return [:]
+    }
+
+    let pidList = pids.map(String.init).joined(separator: ",")
+    guard let output = runCommand("/usr/sbin/lsof", ["-nP", "-a", "-p", pidList, "-d", "cwd", "-Fpn"]) else {
+        return [:]
+    }
+
+    var currentPID: Int?
+    var result: [Int: String] = [:]
+
+    for line in output.split(separator: "\n").map(String.init) {
+        if line.hasPrefix("p") {
+            currentPID = Int(line.dropFirst())
+        } else if line.hasPrefix("n"), let pid = currentPID {
+            result[pid] = String(line.dropFirst())
+        }
+    }
+
+    return result
+}
+
+func portsFromLsofName(_ name: String) -> [Int] {
+    let pattern = #":(\d{2,5})(?:\s|$)"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        return []
+    }
+
+    let range = NSRange(name.startIndex..<name.endIndex, in: name)
+    return regex.matches(in: name, range: range).compactMap { match in
+        guard match.numberOfRanges > 1,
+              let portRange = Range(match.range(at: 1), in: name),
+              let port = Int(name[portRange]),
+              (1...65535).contains(port) else {
+            return nil
+        }
+
+        return port
+    }
+}
+
+func listeningPortsByPID() -> [Int: [Int]] {
+    guard let output = runCommand("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]) else {
+        return [:]
+    }
+
+    var currentPID: Int?
+    var result: [Int: Set<Int>] = [:]
+
+    for line in output.split(separator: "\n").map(String.init) {
+        if line.hasPrefix("p") {
+            currentPID = Int(line.dropFirst())
+        } else if line.hasPrefix("n"), let pid = currentPID {
+            let ports = portsFromLsofName(String(line.dropFirst()))
+            if !ports.isEmpty {
+                result[pid, default: []].formUnion(ports)
+            }
+        }
+    }
+
+    return result.mapValues { Array($0).sorted() }
+}
+
+func nearestPackageRoot(from cwd: String?) -> String? {
+    guard let cwd, !cwd.isEmpty else {
+        return nil
+    }
+
+    let fileManager = FileManager.default
+    var current = URL(fileURLWithPath: cwd).standardizedFileURL
+
+    for _ in 0..<10 {
+        let packagePath = current.appendingPathComponent("package.json").path
+        if fileManager.fileExists(atPath: packagePath) {
+            return current.path
+        }
+
+        let parent = current.deletingLastPathComponent()
+        if parent.path == current.path {
+            break
+        }
+
+        current = parent
+    }
+
+    return URL(fileURLWithPath: cwd).standardizedFileURL.path
+}
+
+func packageName(at root: String?) -> String? {
+    guard let root else {
+        return nil
+    }
+
+    let packageURL = URL(fileURLWithPath: root).appendingPathComponent("package.json")
+    guard let data = try? Data(contentsOf: packageURL),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let name = json["name"] as? String,
+          !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+
+    if let slashIndex = name.lastIndex(of: "/") {
+        return String(name[name.index(after: slashIndex)...])
+    }
+
+    return name
+}
+
+func folderName(from path: String?) -> String? {
+    guard let path, !path.isEmpty else {
+        return nil
+    }
+
+    let name = URL(fileURLWithPath: path).lastPathComponent
+    return name.isEmpty ? nil : name
+}
+
+func commandTokens(_ text: String) -> [String] {
+    return text
+        .split { $0 == " " || $0 == "\t" || $0 == "\n" }
+        .map(String.init)
+}
+
+func commandText(for process: NodeProcess) -> String {
+    return process.args.isEmpty ? process.command : process.args
+}
+
+func nextNonOptionToken(after index: Int, in tokens: [String]) -> String? {
+    var currentIndex = index + 1
+    while currentIndex < tokens.count {
+        let token = tokens[currentIndex]
+        if !token.hasPrefix("-") {
+            return token
+        }
+
+        currentIndex += 1
+    }
+
+    return nil
+}
+
+func npmScriptLabel(prefix: String, tokens: [String]) -> String? {
+    let lowerTokens = tokens.map { $0.lowercased() }
+    if let runIndex = lowerTokens.firstIndex(of: "run"),
+       let script = nextNonOptionToken(after: runIndex, in: tokens) {
+        return "\(prefix) run \(script)"
+    }
+
+    if let script = tokens.dropFirst().first(where: { !$0.hasPrefix("-") && !$0.contains(".js") }) {
+        return "\(prefix) \(script)"
+    }
+
+    return nil
+}
+
+func commandSummary(for process: NodeProcess) -> String {
+    let text = commandText(for: process)
+    let tokens = commandTokens(text)
+    let lowerText = text.lowercased()
+    let lowerTokens = tokens.map { $0.lowercased() }
+
+    if lowerTokens.contains(where: { $0.contains("npm-cli.js") || ($0 as NSString).lastPathComponent == "npm" }) {
+        return npmScriptLabel(prefix: "npm", tokens: tokens) ?? "npm"
+    }
+
+    if lowerTokens.contains(where: { $0.contains("pnpm.cjs") || ($0 as NSString).lastPathComponent == "pnpm" }) {
+        return npmScriptLabel(prefix: "pnpm", tokens: tokens) ?? "pnpm"
+    }
+
+    if lowerTokens.contains(where: { $0.contains("yarn.js") || ($0 as NSString).lastPathComponent == "yarn" }) {
+        return npmScriptLabel(prefix: "yarn", tokens: tokens) ?? "yarn"
+    }
+
+    if lowerText.contains("next") {
+        return lowerText.contains("dev") ? "next dev" : "next"
+    }
+
+    if lowerText.contains("vite") {
+        return "vite"
+    }
+
+    if lowerText.contains("astro") {
+        return "astro"
+    }
+
+    if lowerText.contains("remix") {
+        return "remix"
+    }
+
+    if lowerText.contains("nuxt") {
+        return "nuxt"
+    }
+
+    if lowerText.contains("webpack") {
+        return "webpack"
+    }
+
+    if lowerText.contains("nodemon") {
+        return "nodemon"
+    }
+
+    if lowerText.contains("tsx") {
+        return "tsx"
+    }
+
+    return process.commandName
+}
+
+func frameworkLabel(for process: NodeProcess, commandSummary: String, hasPorts: Bool) -> String {
+    let text = commandText(for: process).lowercased()
+
+    if text.contains("next") {
+        return "Next.js"
+    }
+
+    if text.contains("vite") {
+        return "Vite"
+    }
+
+    if text.contains("astro") {
+        return "Astro"
+    }
+
+    if text.contains("remix") {
+        return "Remix"
+    }
+
+    if text.contains("nuxt") {
+        return "Nuxt"
+    }
+
+    if text.contains("webpack") {
+        return "Webpack"
+    }
+
+    if text.contains("nodemon") {
+        return "Nodemon"
+    }
+
+    if commandSummary.hasPrefix("npm") || commandSummary.hasPrefix("pnpm") || commandSummary.hasPrefix("yarn") {
+        return "npm script"
+    }
+
+    return hasPorts ? "Local server" : "Node"
+}
+
+func buildProcessDisplays() -> [ProcessDisplay] {
+    let processes = listNodeProcesses().sorted { $0.pid < $1.pid }
+    let pids = processes.map { $0.pid }
+    let cwds = processCwdsByPID(pids)
+    let ports = listeningPortsByPID()
+
+    return processes.map { process in
+        let cwd = cwds[process.pid]
+        let root = nearestPackageRoot(from: cwd)
+        let projectName = packageName(at: root)
+            ?? folderName(from: root)
+            ?? folderName(from: cwd)
+            ?? process.commandName
+        let processPorts = ports[process.pid] ?? []
+        let summary = commandSummary(for: process)
+
+        return ProcessDisplay(
+            process: process,
+            cwd: cwd,
+            projectRoot: root,
+            projectName: projectName,
+            framework: frameworkLabel(for: process, commandSummary: summary, hasPorts: !processPorts.isEmpty),
+            commandSummary: summary,
+            ports: processPorts
+        )
+    }
+}
+
 func shellQuote(_ value: String) -> String {
     return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
@@ -156,7 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private let processQueue = DispatchQueue(label: "dev.nodesnoop.processes", qos: .utility)
     private var statusItem: NSStatusItem?
-    private var cachedProcesses: [NodeProcess] = []
+    private var cachedProcesses: [ProcessDisplay] = []
     private var isRefreshing = false
     private var lastRefreshDate: Date?
 
@@ -180,19 +490,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshProcesses()
     }
 
-    private func commandLabel(for process: NodeProcess, limit: Int = 58) -> String {
-        let command = process.args.isEmpty ? process.command : process.args
-        let normalized = command.replacingOccurrences(
+    private func clipped(_ value: String, limit: Int) -> String {
+        if value.count <= limit {
+            return value
+        }
+
+        return String(value.prefix(max(0, limit - 3))) + "..."
+    }
+
+    private func normalized(_ value: String) -> String {
+        return value.replacingOccurrences(
             of: #"\s+"#,
             with: " ",
             options: .regularExpression
         )
-
-        return normalized.count > limit ? String(normalized.prefix(limit - 3)) + "..." : normalized
     }
 
-    private func processTitle(for process: NodeProcess) -> String {
-        return "PID \(process.pid) - \(commandLabel(for: process))"
+    private func tildePath(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        if path == home {
+            return "~"
+        }
+
+        if path.hasPrefix(home + "/") {
+            return "~" + String(path.dropFirst(home.count))
+        }
+
+        return path
+    }
+
+    private func portSummary(for process: ProcessDisplay, limit: Int = 3) -> String {
+        let visiblePorts = process.ports.prefix(limit).map { ":\($0)" }
+        let suffix = process.ports.count > limit ? ", ..." : ""
+        return visiblePorts.joined(separator: ", ") + suffix
+    }
+
+    private func rowTitle(for process: ProcessDisplay) -> String {
+        let project = clipped(process.projectName, limit: 30)
+        let pid = "PID \(process.process.pid)"
+
+        if process.isLocalhostProject {
+            let local = "LOCAL \(portSummary(for: process))"
+            return "\(project)  \(local)  \(process.framework)  \(pid)"
+        }
+
+        let command = clipped(process.commandSummary, limit: 18)
+        return "\(project)  \(command)  \(pid)"
     }
 
     private func sectionHeader(_ title: String) -> NSMenuItem {
@@ -214,7 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func processCountTitle(_ count: Int, refreshing: Bool = false) -> String {
+    private func processCountTitle(_ count: Int, localCount: Int = 0, refreshing: Bool = false) -> String {
         if refreshing && count == 0 {
             return "Refreshing process list..."
         }
@@ -223,7 +566,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return "No Node.js processes running"
         }
 
-        let title = "\(count) Node.js process\(count == 1 ? "" : "es") running"
+        let processTitle = "\(count) Node.js process\(count == 1 ? "" : "es")"
+        let localTitle = "\(localCount) localhost process\(localCount == 1 ? "" : "es")"
+        let title = localCount > 0 ? "\(processTitle), \(localTitle)" : "\(processTitle) running"
         return refreshing ? "\(title) - refreshing" : title
     }
 
@@ -248,7 +593,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderMenu()
 
         processQueue.async { [weak self] in
-            let processes = listNodeProcesses().sorted { $0.pid < $1.pid }
+            let processes = buildProcessDisplays().sorted {
+                if $0.isLocalhostProject != $1.isLocalhostProject {
+                    return $0.isLocalhostProject && !$1.isLocalhostProject
+                }
+
+                let nameComparison = $0.projectName.localizedCaseInsensitiveCompare($1.projectName)
+                if nameComparison != .orderedSame {
+                    return nameComparison == .orderedAscending
+                }
+
+                return $0.process.pid < $1.process.pid
+            }
 
             DispatchQueue.main.async {
                 guard let self else {
@@ -266,47 +622,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderMenu() {
         menu.removeAllItems()
         let processes = cachedProcesses
+        let localhostProcesses = processes.filter { $0.isLocalhostProject }
+        let otherProcesses = processes.filter { !$0.isLocalhostProject }
 
         let header = disabledItem("NodeSnoop")
         header.image = makeSpruceTreeIcon()
         menu.addItem(header)
-        menu.addItem(disabledItem(processCountTitle(processes.count, refreshing: isRefreshing)))
-        statusItem?.button?.toolTip = "NodeSnoop - \(processCountTitle(processes.count))"
+        menu.addItem(disabledItem(processCountTitle(processes.count, localCount: localhostProcesses.count, refreshing: isRefreshing)))
+        statusItem?.button?.toolTip = "NodeSnoop - \(processCountTitle(processes.count, localCount: localhostProcesses.count))"
         menu.addItem(NSMenuItem.separator())
 
-        menu.addItem(sectionHeader("Processes"))
         if processes.isEmpty && isRefreshing {
+            menu.addItem(sectionHeader("Processes"))
             menu.addItem(disabledItem("Refreshing..."))
         } else if processes.isEmpty {
+            menu.addItem(sectionHeader("Processes"))
             menu.addItem(disabledItem("No running Node.js processes"))
         } else {
-            for process in processes {
-                let item = NSMenuItem(title: processTitle(for: process), action: nil, keyEquivalent: "")
-                let submenu = NSMenu()
+            if !localhostProcesses.isEmpty {
+                menu.addItem(sectionHeader("Localhost Projects"))
+                for process in localhostProcesses {
+                    menu.addItem(processMenuItem(for: process))
+                }
+            }
 
-                submenu.addItem(disabledItem("PID \(process.pid)"))
-                submenu.addItem(disabledItem("Parent PID \(process.ppid) - Status \(process.stat)"))
-                submenu.addItem(NSMenuItem.separator())
+            if !localhostProcesses.isEmpty && !otherProcesses.isEmpty {
+                menu.addItem(NSMenuItem.separator())
+            }
 
-                let openItem = NSMenuItem(title: "Open Terminal at Working Directory", action: #selector(openProcessTerminal(_:)), keyEquivalent: "")
-                openItem.target = self
-                openItem.representedObject = process.pid
-                submenu.addItem(openItem)
-
-                let copyItem = NSMenuItem(title: "Copy PID", action: #selector(copyProcessPID(_:)), keyEquivalent: "")
-                copyItem.target = self
-                copyItem.representedObject = process.pid
-                submenu.addItem(copyItem)
-
-                submenu.addItem(NSMenuItem.separator())
-
-                let killItem = NSMenuItem(title: "Kill Process", action: #selector(killMenuItemProcess(_:)), keyEquivalent: "")
-                killItem.target = self
-                killItem.representedObject = process.pid
-                submenu.addItem(killItem)
-
-                item.submenu = submenu
-                menu.addItem(item)
+            if !otherProcesses.isEmpty {
+                menu.addItem(sectionHeader("Other Node Processes"))
+                for process in otherProcesses {
+                    menu.addItem(processMenuItem(for: process))
+                }
             }
         }
 
@@ -330,13 +678,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quitItem)
     }
 
-    @objc private func openProcessTerminal(_ sender: NSMenuItem) {
-        guard let pid = sender.representedObject as? Int else {
+    private func payload(for process: ProcessDisplay) -> ProcessMenuPayload {
+        return ProcessMenuPayload(
+            pid: process.process.pid,
+            cwd: process.projectRoot ?? process.cwd,
+            url: process.primaryURL
+        )
+    }
+
+    private func processMenuItem(for process: ProcessDisplay) -> NSMenuItem {
+        let item = NSMenuItem(title: rowTitle(for: process), action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let itemPayload = payload(for: process)
+
+        submenu.addItem(disabledItem(process.projectName))
+
+        if process.isLocalhostProject {
+            submenu.addItem(disabledItem("Localhost \(portSummary(for: process))"))
+        }
+
+        submenu.addItem(disabledItem("\(process.framework) - \(process.commandSummary)"))
+
+        if let cwd = process.projectRoot ?? process.cwd {
+            submenu.addItem(disabledItem(clipped(tildePath(cwd), limit: 72)))
+        }
+
+        submenu.addItem(disabledItem("PID \(process.process.pid) - Parent \(process.process.ppid) - Status \(process.process.stat)"))
+        submenu.addItem(NSMenuItem.separator())
+
+        if process.primaryURL != nil {
+            let openLocalhostItem = NSMenuItem(title: "Open Localhost", action: #selector(openLocalhost(_:)), keyEquivalent: "")
+            openLocalhostItem.target = self
+            openLocalhostItem.representedObject = itemPayload
+            submenu.addItem(openLocalhostItem)
+
+            let copyURLItem = NSMenuItem(title: "Copy Localhost URL", action: #selector(copyLocalhostURL(_:)), keyEquivalent: "")
+            copyURLItem.target = self
+            copyURLItem.representedObject = itemPayload
+            submenu.addItem(copyURLItem)
+        }
+
+        if itemPayload.cwd != nil {
+            let openItem = NSMenuItem(title: "Open Terminal at Project", action: #selector(openProcessTerminal(_:)), keyEquivalent: "")
+            openItem.target = self
+            openItem.representedObject = itemPayload
+            submenu.addItem(openItem)
+
+            let copyPathItem = NSMenuItem(title: "Copy Project Path", action: #selector(copyProjectPath(_:)), keyEquivalent: "")
+            copyPathItem.target = self
+            copyPathItem.representedObject = itemPayload
+            submenu.addItem(copyPathItem)
+        }
+
+        let copyItem = NSMenuItem(title: "Copy PID", action: #selector(copyProcessPID(_:)), keyEquivalent: "")
+        copyItem.target = self
+        copyItem.representedObject = itemPayload
+        submenu.addItem(copyItem)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let killItem = NSMenuItem(title: "Kill Process", action: #selector(killMenuItemProcess(_:)), keyEquivalent: "")
+        killItem.target = self
+        killItem.representedObject = itemPayload
+        submenu.addItem(killItem)
+
+        item.submenu = submenu
+        item.toolTip = normalized(commandText(for: process.process))
+        return item
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    @objc private func openLocalhost(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProcessMenuPayload,
+              let urlString = payload.url,
+              let url = URL(string: urlString) else {
+            NSSound.beep()
             return
         }
 
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openProcessTerminal(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProcessMenuPayload else {
+            return
+        }
+
+        let pid = payload.pid
+        let cachedCwd = payload.cwd
+
         processQueue.async {
-            guard let cwd = processCwd(pid: pid) else {
+            guard let cwd = cachedCwd ?? processCwd(pid: pid) else {
                 DispatchQueue.main.async {
                     NSSound.beep()
                 }
@@ -347,21 +783,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func copyProcessPID(_ sender: NSMenuItem) {
-        guard let pid = sender.representedObject as? Int else {
+    @objc private func copyLocalhostURL(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProcessMenuPayload,
+              let url = payload.url else {
             return
         }
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(String(pid), forType: .string)
+        copyToPasteboard(url)
+    }
+
+    @objc private func copyProjectPath(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProcessMenuPayload,
+              let cwd = payload.cwd else {
+            return
+        }
+
+        copyToPasteboard(cwd)
+    }
+
+    @objc private func copyProcessPID(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProcessMenuPayload else {
+            return
+        }
+
+        copyToPasteboard(String(payload.pid))
     }
 
     @objc private func killMenuItemProcess(_ sender: NSMenuItem) {
-        guard let pid = sender.representedObject as? Int else {
+        guard let payload = sender.representedObject as? ProcessMenuPayload else {
             return
         }
 
-        cachedProcesses.removeAll { $0.pid == pid }
+        let pid = payload.pid
+        cachedProcesses.removeAll { $0.process.pid == pid }
         renderMenu()
 
         processQueue.async { [weak self] in
@@ -374,7 +828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func killAllProcesses(_ sender: NSMenuItem) {
-        let pids = cachedProcesses.map { $0.pid }
+        let pids = cachedProcesses.map { $0.process.pid }
         cachedProcesses = []
         renderMenu()
 
