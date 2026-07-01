@@ -1,6 +1,6 @@
 {
   "name": "nodesnoop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Find and manage running Node.js processes from the terminal or macOS menu bar.",
   "type": "module",
   "homepage": "https://github.com/mattrichmo/nodesnoop#readme",

@@ -19,9 +19,10 @@ struct ProcessDisplay {
     let commandSummary: String
     let toolLabel: String?
     let ports: [Int]
+    let inferredPorts: [Int]
 
     var isLocalhostProject: Bool {
-        return !ports.isEmpty
+        return !visiblePorts.isEmpty
     }
 
     var isDevelopmentTool: Bool {
@@ -29,11 +30,19 @@ struct ProcessDisplay {
     }
 
     var primaryURL: String? {
-        guard let port = ports.first else {
+        guard let port = visiblePorts.first else {
             return nil
         }
 
         return "http://localhost:\(port)"
+    }
+
+    var visiblePorts: [Int] {
+        return ports.isEmpty ? inferredPorts : ports
+    }
+
+    var usesInferredPorts: Bool {
+        return ports.isEmpty && !inferredPorts.isEmpty
     }
 }
 
@@ -46,10 +55,11 @@ struct ProjectDisplay {
     let commandSummary: String
     let toolLabel: String?
     let ports: [Int]
+    let inferredPorts: [Int]
     let processes: [ProcessDisplay]
 
     var isLocalhostProject: Bool {
-        return !ports.isEmpty && !isDevelopmentTool
+        return !visiblePorts.isEmpty && !isDevelopmentTool
     }
 
     var isDevelopmentTool: Bool {
@@ -57,11 +67,19 @@ struct ProjectDisplay {
     }
 
     var primaryURL: String? {
-        guard let port = ports.first else {
+        guard let port = visiblePorts.first else {
             return nil
         }
 
         return "http://localhost:\(port)"
+    }
+
+    var visiblePorts: [Int] {
+        return ports.isEmpty ? inferredPorts : ports
+    }
+
+    var usesInferredPorts: Bool {
+        return ports.isEmpty && !inferredPorts.isEmpty
     }
 
     var processCount: Int {
@@ -169,7 +187,7 @@ func parsePSLine(_ line: String) -> NodeProcess? {
     )
 }
 
-func listNodeProcesses() -> [NodeProcess] {
+func listProcesses() -> [NodeProcess] {
     guard let output = runCommand("/bin/ps", ["-axo", "pid=,ppid=,stat=,comm=,args="]) else {
         return []
     }
@@ -177,6 +195,10 @@ func listNodeProcesses() -> [NodeProcess] {
     return output
         .split(separator: "\n")
         .compactMap { parsePSLine(String($0)) }
+}
+
+func listNodeProcesses() -> [NodeProcess] {
+    return listProcesses()
         .filter { $0.commandName == "node" || $0.commandName == "nodejs" }
 }
 
@@ -261,6 +283,39 @@ func listeningPortsByPID() -> [Int: [Int]] {
     return result.mapValues { Array($0).sorted() }
 }
 
+func childrenByParent(from processes: [NodeProcess]) -> [Int: [Int]] {
+    var result: [Int: [Int]] = [:]
+
+    for process in processes {
+        result[process.ppid, default: []].append(process.pid)
+    }
+
+    return result
+}
+
+func descendantPIDs(of pid: Int, childrenByParent: [Int: [Int]]) -> Set<Int> {
+    var result: Set<Int> = []
+    var stack = childrenByParent[pid] ?? []
+
+    while let childPID = stack.popLast() {
+        guard !result.contains(childPID) else {
+            continue
+        }
+
+        result.insert(childPID)
+        stack.append(contentsOf: childrenByParent[childPID] ?? [])
+    }
+
+    return result
+}
+
+func detectedPorts(for pid: Int, childrenByParent: [Int: [Int]], listeningPorts: [Int: [Int]]) -> [Int] {
+    var relatedPIDs = descendantPIDs(of: pid, childrenByParent: childrenByParent)
+    relatedPIDs.insert(pid)
+
+    return Array(Set(relatedPIDs.flatMap { listeningPorts[$0] ?? [] })).sorted()
+}
+
 func nearestPackageRoot(from cwd: String?) -> String? {
     guard let cwd, !cwd.isEmpty else {
         return nil
@@ -319,6 +374,41 @@ func commandTokens(_ text: String) -> [String] {
     return text
         .split { $0 == " " || $0 == "\t" || $0 == "\n" }
         .map(String.init)
+}
+
+func validPort(_ value: String) -> Int? {
+    guard let port = Int(value), (1...65535).contains(port) else {
+        return nil
+    }
+
+    return port
+}
+
+func explicitPortsFromCommand(_ text: String) -> [Int] {
+    let tokens = commandTokens(text)
+    var ports: Set<Int> = []
+
+    for (index, token) in tokens.enumerated() {
+        if token == "--port" || token == "-p" {
+            if index + 1 < tokens.count, let port = validPort(tokens[index + 1]) {
+                ports.insert(port)
+            }
+        } else if token.hasPrefix("--port=") {
+            if let port = validPort(String(token.dropFirst("--port=".count))) {
+                ports.insert(port)
+            }
+        } else if token.hasPrefix("-p"), token.count > 2 {
+            if let port = validPort(String(token.dropFirst(2))) {
+                ports.insert(port)
+            }
+        } else if token.hasPrefix("PORT=") {
+            if let port = validPort(String(token.dropFirst("PORT=".count))) {
+                ports.insert(port)
+            }
+        }
+    }
+
+    return Array(ports).sorted()
 }
 
 func commandText(for process: NodeProcess) -> String {
@@ -491,11 +581,49 @@ func frameworkLabel(for process: NodeProcess, commandSummary: String, hasPorts: 
     return hasPorts ? "Local server" : "Node"
 }
 
+func inferredDefaultPorts(for process: NodeProcess, framework: String, commandSummary: String, knownPorts: [Int]) -> [Int] {
+    guard knownPorts.isEmpty else {
+        return []
+    }
+
+    let text = "\(commandText(for: process)) \(commandSummary)".lowercased()
+
+    if framework == "Next.js", text.contains("dev") {
+        return [3000]
+    }
+
+    if framework == "Vite", text.contains("vite") {
+        return [5173]
+    }
+
+    if framework == "Astro", text.contains("astro") {
+        return [4321]
+    }
+
+    if framework == "Nuxt", text.contains("nuxt") {
+        return [3000]
+    }
+
+    if framework == "Remix", text.contains("remix") {
+        return [3000]
+    }
+
+    if framework == "Webpack", text.contains("serve") {
+        return [8080]
+    }
+
+    return []
+}
+
 func buildProcessDisplays() -> [ProcessDisplay] {
-    let processes = listNodeProcesses().sorted { $0.pid < $1.pid }
+    let allProcesses = listProcesses()
+    let processes = allProcesses
+        .filter { $0.commandName == "node" || $0.commandName == "nodejs" }
+        .sorted { $0.pid < $1.pid }
     let pids = processes.map { $0.pid }
     let cwds = processCwdsByPID(pids)
-    let ports = listeningPortsByPID()
+    let listeningPorts = listeningPortsByPID()
+    let childMap = childrenByParent(from: allProcesses)
 
     return processes.map { process in
         let cwd = cwds[process.pid]
@@ -504,10 +632,15 @@ func buildProcessDisplays() -> [ProcessDisplay] {
             ?? folderName(from: root)
             ?? folderName(from: cwd)
             ?? process.commandName
-        let processPorts = ports[process.pid] ?? []
+        let detectedProcessPorts = detectedPorts(for: process.pid, childrenByParent: childMap, listeningPorts: listeningPorts)
         let summary = commandSummary(for: process)
         let toolLabel = knownToolLabel(for: process, commandSummary: summary)
+        let explicitPorts = explicitPortsFromCommand(commandText(for: process))
+        let processPorts = Array(Set(detectedProcessPorts + explicitPorts)).sorted()
         let framework = toolLabel ?? frameworkLabel(for: process, commandSummary: summary, hasPorts: !processPorts.isEmpty)
+        let inferredPorts = toolLabel == nil
+            ? inferredDefaultPorts(for: process, framework: framework, commandSummary: summary, knownPorts: processPorts)
+            : []
 
         return ProcessDisplay(
             process: process,
@@ -517,7 +650,8 @@ func buildProcessDisplays() -> [ProcessDisplay] {
             framework: framework,
             commandSummary: summary,
             toolLabel: toolLabel,
-            ports: processPorts
+            ports: processPorts,
+            inferredPorts: inferredPorts
         )
     }
 }
@@ -573,6 +707,7 @@ func buildProjectDisplays() -> [ProjectDisplay] {
         let processes = group.sorted { $0.process.pid < $1.process.pid }
         let first = processes[0]
         let ports = Array(Set(processes.flatMap { $0.ports })).sorted()
+        let inferredPorts = ports.isEmpty ? Array(Set(processes.flatMap { $0.inferredPorts })).sorted() : []
         let toolLabel = first.toolLabel
 
         return ProjectDisplay(
@@ -584,6 +719,7 @@ func buildProjectDisplays() -> [ProjectDisplay] {
             commandSummary: preferredCommandSummary(from: processes),
             toolLabel: toolLabel,
             ports: ports,
+            inferredPorts: inferredPorts,
             processes: processes
         )
     }
@@ -776,7 +912,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if project.isLocalhostProject {
-            let local = "LOCAL \(portSummary(for: project.ports))"
+            let localPrefix = project.usesInferredPorts ? "LIKELY" : "LOCAL"
+            let local = "\(localPrefix) \(portSummary(for: project.visiblePorts))"
             return "\(projectName)  \(local)  \(project.framework)  \(count)"
         }
 
@@ -1001,7 +1138,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if project.isDevelopmentTool {
             submenu.addItem(disabledItem(project.toolLabel ?? project.framework))
         } else if project.isLocalhostProject {
-            submenu.addItem(disabledItem("Localhost \(portSummary(for: project.ports))"))
+            let localTitle = project.usesInferredPorts ? "Likely localhost" : "Localhost"
+            submenu.addItem(disabledItem("\(localTitle) \(portSummary(for: project.visiblePorts))"))
         } else {
             submenu.addItem(disabledItem("No detected localhost port"))
         }
@@ -1208,6 +1346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             let remainingPorts = Array(Set(remainingProcesses.flatMap { $0.ports })).sorted()
+            let remainingInferredPorts = remainingPorts.isEmpty
+                ? Array(Set(remainingProcesses.flatMap { $0.inferredPorts })).sorted()
+                : []
             return ProjectDisplay(
                 id: project.id,
                 projectRoot: project.projectRoot,
@@ -1217,6 +1358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 commandSummary: preferredCommandSummary(from: remainingProcesses),
                 toolLabel: project.toolLabel,
                 ports: remainingPorts,
+                inferredPorts: remainingInferredPorts,
                 processes: remainingProcesses
             )
         }
