@@ -1,35 +1,72 @@
+<p align="center">
+  <img src="docs/assets/nodesnoop-header.png" alt="NodeSnoop spruce tree banner" width="100%">
+</p>
+
 # NodeSnoop
 
-NodeSnoop finds and manages running Node.js processes from a CLI, a small terminal UI, and a native macOS menu bar app.
+NodeSnoop is a spruce-tree menu bar app and terminal tool for seeing, opening, and stopping the Node.js projects running on your Mac.
+
+<p align="center">
+  <img src="docs/assets/nodesnoop-product.png" alt="NodeSnoop menu bar app showing grouped localhost projects and project actions" width="100%">
+</p>
+
+## What It Does
+
+- Groups related Node.js processes by project instead of showing one noisy PID list.
+- Detects localhost apps from live listeners, child listener processes, `--port`, `PORT=`, and likely framework defaults.
+- Separates app projects from common development tools such as Claude Code, Codex, TypeScript language servers, ESLint, Prettier, VS Code, and Cursor.
+- Opens localhost URLs, opens Terminal at a project folder, copies project paths or process IDs, and stops one project at a time.
+- Includes a simple CLI, a keyboard-driven TUI, and a native macOS menu bar app.
 
 ## Install
 
-During local development:
+Until the npm package is published, install the current GitHub version:
 
 ```sh
-npm install
-npm link
+npm install -g github:mattrichmo/nodesnoop#main
+nodesnoop app install
 ```
 
-After publishing:
+After the package is published to npm:
 
 ```sh
 npm install -g nodesnoop
+nodesnoop app install
+```
+
+`nodesnoop app install` builds the native AppKit app from the included Swift source, installs it to `~/Applications/NodeSnoop.app`, and launches it.
+
+## Menu Bar App
+
+```sh
+nodesnoop app install
+```
+
+The menu bar app uses the spruce icon in the macOS menu bar. The menu is organized into status, localhost projects, other projects, development tools, bulk actions, and application settings.
+
+Project submenus include actions for opening localhost when detected, opening Terminal at the project directory, copying the localhost URL, copying the project path, copying PIDs, stopping the project, and inspecting individual processes.
+
+The app also includes an `Open at Login` toggle. It creates a user LaunchAgent at:
+
+```text
+~/Library/LaunchAgents/dev.nodesnoop.menubar.login-item.plist
 ```
 
 ## CLI
 
 ```sh
 nodesnoop list
+nodesnoop list --json
 nodesnoop tui
 nodesnoop kill all
 nodesnoop kill all --force
+nodesnoop kill all --dry-run
 nodesnoop open <pid>
 ```
 
 `nodesnoop kill all` sends `SIGTERM` to every detected Node.js process except the `nodesnoop` CLI process itself. Use `--force` to send `SIGKILL`.
 
-`nodesnoop open <pid>` opens Terminal at the process working directory when macOS allows that directory to be read. A process cannot generally be reattached to a new terminal after it is already running unless it was started inside a terminal multiplexer such as `tmux` or `screen`, so NodeSnoop opens the closest useful context: the process cwd.
+`nodesnoop open <pid>` opens Terminal at the process working directory when macOS allows that directory to be read. A running process generally cannot be reattached to a new terminal unless it was started inside a terminal multiplexer such as `tmux` or `screen`, so NodeSnoop opens the closest useful context: the process cwd.
 
 ## TUI
 
@@ -46,43 +83,12 @@ Keys:
 - `r`: refresh
 - `q`: quit
 
-## macOS Menu Bar App
-
-Build the native AppKit menu bar app:
-
-```sh
-nodesnoop app build
-```
-
-By default this builds into `~/Library/Caches/nodesnoop`, which works from a global npm install. For local development output:
-
-```sh
-nodesnoop app build --out-dir dist
-```
-
-Launch it:
-
-```sh
-nodesnoop app open
-```
-
-Install it into `~/Applications` and launch it:
-
-```sh
-nodesnoop app install
-```
-
-The app uses a spruce tree menu bar icon and keeps the menu organized into status, localhost projects, other projects, development tools, bulk actions, and application sections. It groups related Node processes by nearby `package.json` project, detects common dev servers such as Vite and Next.js, and aggregates localhost ports from project processes, child listener processes, and explicit `--port`/`PORT=` command arguments. When no live listener is visible yet, it can show likely defaults such as Next.js on `:3000` and Vite on `:5173`. It also labels common tooling such as Claude Code, Codex, TypeScript language servers, ESLint, Prettier, VS Code, and Cursor separately so editor/helper processes are not confused with app projects. Each project has actions to open localhost when available, open Terminal at the project directory, copy its URL/path/process IDs, or stop the whole project. Individual PIDs remain available under each project for advanced process-level actions. The menu also includes kill-all, refresh, and Open at Login actions.
-
-Building the macOS app requires Swift and the macOS command line tools.
-
-## Packaging Notes
-
-This package is designed to publish to npm with no runtime dependencies for the CLI/TUI. The macOS app is built locally from included Swift source so the npm package does not need to ship a large Electron runtime or prebuilt binaries per architecture.
-
 ## Development
 
 ```sh
+npm install
 npm test
 npm run app:build
 ```
+
+The CLI/TUI has no runtime npm dependencies. The macOS app is built locally from Swift source, so the package does not need Electron or prebuilt architecture-specific binaries.

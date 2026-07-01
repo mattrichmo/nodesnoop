@@ -19,6 +19,7 @@
     "src",
     "macos",
     "scripts",
+    "docs/assets",
     "README.md",
     "LICENSE"
   ],
