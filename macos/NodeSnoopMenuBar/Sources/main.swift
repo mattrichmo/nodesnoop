@@ -22,16 +22,17 @@ func runCommand(_ executable: String, _ arguments: [String]) -> String? {
 
     do {
         try process.run()
-        process.waitUntilExit()
     } catch {
         return nil
     }
+
+    let data = stdout.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
 
     guard process.terminationStatus == 0 else {
         return nil
     }
 
-    let data = stdout.fileHandleForReading.readDataToEndOfFile()
     return String(data: data, encoding: .utf8)
 }
 
@@ -153,7 +154,11 @@ func makeSpruceTreeIcon() -> NSImage {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
+    private let processQueue = DispatchQueue(label: "dev.nodesnoop.processes", qos: .utility)
     private var statusItem: NSStatusItem?
+    private var cachedProcesses: [NodeProcess] = []
+    private var isRefreshing = false
+    private var lastRefreshDate: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -166,11 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.delegate = self
         statusItem?.menu = menu
-        rebuildMenu()
+        renderMenu()
+        refreshProcesses(force: true)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        rebuildMenu()
+        renderMenu()
+        refreshProcesses()
     }
 
     private func commandLabel(for process: NodeProcess, limit: Int = 58) -> String {
@@ -207,26 +214,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func processCountTitle(_ count: Int) -> String {
+    private func processCountTitle(_ count: Int, refreshing: Bool = false) -> String {
+        if refreshing && count == 0 {
+            return "Refreshing process list..."
+        }
+
         if count == 0 {
             return "No Node.js processes running"
         }
 
-        return "\(count) Node.js process\(count == 1 ? "" : "es") running"
+        let title = "\(count) Node.js process\(count == 1 ? "" : "es") running"
+        return refreshing ? "\(title) - refreshing" : title
     }
 
-    private func rebuildMenu() {
+    private func shouldRefresh() -> Bool {
+        guard let lastRefreshDate else {
+            return true
+        }
+
+        return Date().timeIntervalSince(lastRefreshDate) > 2
+    }
+
+    private func refreshProcesses(force: Bool = false) {
+        guard force || shouldRefresh() else {
+            return
+        }
+
+        guard !isRefreshing else {
+            return
+        }
+
+        isRefreshing = true
+        renderMenu()
+
+        processQueue.async { [weak self] in
+            let processes = listNodeProcesses().sorted { $0.pid < $1.pid }
+
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
+
+                self.cachedProcesses = processes
+                self.lastRefreshDate = Date()
+                self.isRefreshing = false
+                self.renderMenu()
+            }
+        }
+    }
+
+    private func renderMenu() {
         menu.removeAllItems()
-        let processes = listNodeProcesses().sorted { $0.pid < $1.pid }
+        let processes = cachedProcesses
 
         let header = disabledItem("NodeSnoop")
         header.image = makeSpruceTreeIcon()
         menu.addItem(header)
-        menu.addItem(disabledItem(processCountTitle(processes.count)))
+        menu.addItem(disabledItem(processCountTitle(processes.count, refreshing: isRefreshing)))
+        statusItem?.button?.toolTip = "NodeSnoop - \(processCountTitle(processes.count))"
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(sectionHeader("Processes"))
-        if processes.isEmpty {
+        if processes.isEmpty && isRefreshing {
+            menu.addItem(disabledItem("Refreshing..."))
+        } else if processes.isEmpty {
             menu.addItem(disabledItem("No running Node.js processes"))
         } else {
             for process in processes {
@@ -280,13 +331,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openProcessTerminal(_ sender: NSMenuItem) {
-        guard let pid = sender.representedObject as? Int,
-              let cwd = processCwd(pid: pid) else {
-            NSSound.beep()
+        guard let pid = sender.representedObject as? Int else {
             return
         }
 
-        openTerminal(at: cwd)
+        processQueue.async {
+            guard let cwd = processCwd(pid: pid) else {
+                DispatchQueue.main.async {
+                    NSSound.beep()
+                }
+                return
+            }
+
+            openTerminal(at: cwd)
+        }
     }
 
     @objc private func copyProcessPID(_ sender: NSMenuItem) {
@@ -303,20 +361,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        killProcess(pid: pid)
-        rebuildMenu()
+        cachedProcesses.removeAll { $0.pid == pid }
+        renderMenu()
+
+        processQueue.async { [weak self] in
+            killProcess(pid: pid)
+
+            DispatchQueue.main.async {
+                self?.refreshProcesses(force: true)
+            }
+        }
     }
 
     @objc private func killAllProcesses(_ sender: NSMenuItem) {
-        for process in listNodeProcesses() {
-            killProcess(pid: process.pid)
-        }
+        let pids = cachedProcesses.map { $0.pid }
+        cachedProcesses = []
+        renderMenu()
 
-        rebuildMenu()
+        processQueue.async { [weak self] in
+            for pid in pids {
+                killProcess(pid: pid)
+            }
+
+            DispatchQueue.main.async {
+                self?.refreshProcesses(force: true)
+            }
+        }
     }
 
     @objc private func refresh(_ sender: NSMenuItem) {
-        rebuildMenu()
+        refreshProcesses(force: true)
     }
 
     @objc private func quit(_ sender: NSMenuItem) {
