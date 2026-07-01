@@ -72,7 +72,7 @@ Install it into `~/Applications` and launch it:
 nodesnoop app install
 ```
 
-The app uses a spruce tree menu bar icon and keeps the menu organized into status, localhost projects, other Node processes, bulk actions, and application sections. It detects project names from nearby `package.json` files, labels common dev servers such as Vite and Next.js, and flags listening localhost ports. Each process has actions to open localhost when available, open Terminal at the project directory, copy its URL/path/PID, or kill it. The menu also includes a kill-all action.
+The app uses a spruce tree menu bar icon and keeps the menu organized into status, localhost projects, other Node processes, bulk actions, and application sections. It detects project names from nearby `package.json` files, labels common dev servers such as Vite and Next.js, and flags listening localhost ports. Each process has actions to open localhost when available, open Terminal at the project directory, copy its URL/path/PID, or kill it. The menu also includes kill-all, refresh, and Open at Login actions.
 
 Building the macOS app requires Swift and the macOS command line tools.
 

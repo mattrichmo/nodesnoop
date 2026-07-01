@@ -44,6 +44,15 @@ final class ProcessMenuPayload: NSObject {
     }
 }
 
+enum OpenAtLoginStatus {
+    case disabled
+    case enabled
+    case differentAppCopy
+}
+
+let loginAgentLabel = "dev.nodesnoop.menubar.login-item"
+let loginAgentFileName = "\(loginAgentLabel).plist"
+
 func runCommand(_ executable: String, _ arguments: [String]) -> String? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
@@ -410,6 +419,67 @@ func buildProcessDisplays() -> [ProcessDisplay] {
     }
 }
 
+func loginAgentURL() -> URL {
+    return FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library")
+        .appendingPathComponent("LaunchAgents")
+        .appendingPathComponent(loginAgentFileName)
+}
+
+func currentAppBundlePath() -> String {
+    return Bundle.main.bundleURL.standardizedFileURL.path
+}
+
+func loginAgentAppPath() -> String? {
+    let url = loginAgentURL()
+    guard let data = try? Data(contentsOf: url),
+          let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+          let arguments = plist["ProgramArguments"] as? [String],
+          let appPath = arguments.last else {
+        return nil
+    }
+
+    return URL(fileURLWithPath: appPath).standardizedFileURL.path
+}
+
+func openAtLoginStatus() -> OpenAtLoginStatus {
+    guard let appPath = loginAgentAppPath() else {
+        return .disabled
+    }
+
+    return appPath == currentAppBundlePath() ? .enabled : .differentAppCopy
+}
+
+func setOpenAtLoginEnabled(_ enabled: Bool) throws {
+    let fileManager = FileManager.default
+    let url = loginAgentURL()
+
+    if !enabled {
+        if fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
+        return
+    }
+
+    let launchAgentsURL = url.deletingLastPathComponent()
+    try fileManager.createDirectory(at: launchAgentsURL, withIntermediateDirectories: true)
+
+    let plist: [String: Any] = [
+        "Label": loginAgentLabel,
+        "ProgramArguments": [
+            "/usr/bin/open",
+            "-g",
+            currentAppBundlePath()
+        ],
+        "RunAtLoad": true,
+        "KeepAlive": false,
+        "LimitLoadToSessionType": "Aqua"
+    ]
+
+    let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    try data.write(to: url, options: .atomic)
+}
+
 func shellQuote(_ value: String) -> String {
     return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
@@ -469,6 +539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var cachedProcesses: [ProcessDisplay] = []
     private var isRefreshing = false
     private var lastRefreshDate: Date?
+    private var openAtLoginMessage: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -673,9 +744,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(sectionHeader("Application"))
 
+        let loginStatus = openAtLoginStatus()
+        let openAtLoginItem = NSMenuItem(title: openAtLoginTitle(for: loginStatus), action: #selector(toggleOpenAtLogin(_:)), keyEquivalent: "")
+        openAtLoginItem.target = self
+        switch loginStatus {
+        case .enabled:
+            openAtLoginItem.state = .on
+        case .differentAppCopy:
+            openAtLoginItem.state = .mixed
+        case .disabled:
+            openAtLoginItem.state = .off
+        }
+        menu.addItem(openAtLoginItem)
+
+        if let openAtLoginMessage {
+            menu.addItem(disabledItem(openAtLoginMessage))
+        }
+
         let quitItem = NSMenuItem(title: "Quit NodeSnoop", action: #selector(quit(_:)), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    private func openAtLoginTitle(for status: OpenAtLoginStatus) -> String {
+        switch status {
+        case .disabled, .enabled:
+            return "Open at Login"
+        case .differentAppCopy:
+            return "Open at Login (Different Copy)"
+        }
     }
 
     private func payload(for process: ProcessDisplay) -> ProcessMenuPayload {
@@ -845,6 +942,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func refresh(_ sender: NSMenuItem) {
         refreshProcesses(force: true)
+    }
+
+    @objc private func toggleOpenAtLogin(_ sender: NSMenuItem) {
+        let status = openAtLoginStatus()
+
+        do {
+            switch status {
+            case .enabled:
+                try setOpenAtLoginEnabled(false)
+                openAtLoginMessage = nil
+            case .disabled, .differentAppCopy:
+                try setOpenAtLoginEnabled(true)
+                openAtLoginMessage = nil
+            }
+        } catch {
+            NSSound.beep()
+            openAtLoginMessage = "Open at Login failed: \(error.localizedDescription)"
+        }
+
+        renderMenu()
     }
 
     @objc private func quit(_ sender: NSMenuItem) {
