@@ -17,10 +17,15 @@ struct ProcessDisplay {
     let projectName: String
     let framework: String
     let commandSummary: String
+    let toolLabel: String?
     let ports: [Int]
 
     var isLocalhostProject: Bool {
         return !ports.isEmpty
+    }
+
+    var isDevelopmentTool: Bool {
+        return toolLabel != nil
     }
 
     var primaryURL: String? {
@@ -32,6 +37,42 @@ struct ProcessDisplay {
     }
 }
 
+struct ProjectDisplay {
+    let id: String
+    let projectRoot: String?
+    let cwd: String?
+    let projectName: String
+    let framework: String
+    let commandSummary: String
+    let toolLabel: String?
+    let ports: [Int]
+    let processes: [ProcessDisplay]
+
+    var isLocalhostProject: Bool {
+        return !ports.isEmpty && !isDevelopmentTool
+    }
+
+    var isDevelopmentTool: Bool {
+        return toolLabel != nil
+    }
+
+    var primaryURL: String? {
+        guard let port = ports.first else {
+            return nil
+        }
+
+        return "http://localhost:\(port)"
+    }
+
+    var processCount: Int {
+        return processes.count
+    }
+
+    var pids: [Int] {
+        return processes.map { $0.process.pid }
+    }
+}
+
 final class ProcessMenuPayload: NSObject {
     let pid: Int
     let cwd: String?
@@ -39,6 +80,18 @@ final class ProcessMenuPayload: NSObject {
 
     init(pid: Int, cwd: String?, url: String?) {
         self.pid = pid
+        self.cwd = cwd
+        self.url = url
+    }
+}
+
+final class ProjectMenuPayload: NSObject {
+    let pids: [Int]
+    let cwd: String?
+    let url: String?
+
+    init(pids: [Int], cwd: String?, url: String?) {
+        self.pids = pids
         self.cwd = cwd
         self.url = url
     }
@@ -353,6 +406,53 @@ func commandSummary(for process: NodeProcess) -> String {
     return process.commandName
 }
 
+func knownToolLabel(for process: NodeProcess, commandSummary: String) -> String? {
+    let text = "\(process.command) \(commandText(for: process)) \(commandSummary)".lowercased()
+    let tokens = commandTokens(text).map { ($0 as NSString).lastPathComponent.lowercased() }
+
+    func containsToken(_ needle: String) -> Bool {
+        return tokens.contains(needle) || tokens.contains("\(needle).js") || tokens.contains("\(needle).cjs")
+    }
+
+    if text.contains("claude-code") {
+        return "Claude Code"
+    }
+
+    if containsToken("claude") || text.contains("/claude/") {
+        return "Claude"
+    }
+
+    if containsToken("codex") || text.contains("/codex/") {
+        return "Codex"
+    }
+
+    if text.contains("typescript-language-server") {
+        return "TypeScript LS"
+    }
+
+    if containsToken("tsserver") || text.contains("tsserver.js") {
+        return "tsserver"
+    }
+
+    if containsToken("eslint") || text.contains("eslint.js") {
+        return "ESLint"
+    }
+
+    if containsToken("prettier") || text.contains("prettier/index") {
+        return "Prettier"
+    }
+
+    if text.contains("visual studio code") || text.contains("/vscode/") || text.contains(".vscode") {
+        return "VS Code"
+    }
+
+    if containsToken("cursor") || text.contains("/cursor/") {
+        return "Cursor"
+    }
+
+    return nil
+}
+
 func frameworkLabel(for process: NodeProcess, commandSummary: String, hasPorts: Bool) -> String {
     let text = commandText(for: process).lowercased()
 
@@ -406,15 +506,85 @@ func buildProcessDisplays() -> [ProcessDisplay] {
             ?? process.commandName
         let processPorts = ports[process.pid] ?? []
         let summary = commandSummary(for: process)
+        let toolLabel = knownToolLabel(for: process, commandSummary: summary)
+        let framework = toolLabel ?? frameworkLabel(for: process, commandSummary: summary, hasPorts: !processPorts.isEmpty)
 
         return ProcessDisplay(
             process: process,
             cwd: cwd,
             projectRoot: root,
             projectName: projectName,
-            framework: frameworkLabel(for: process, commandSummary: summary, hasPorts: !processPorts.isEmpty),
+            framework: framework,
             commandSummary: summary,
+            toolLabel: toolLabel,
             ports: processPorts
+        )
+    }
+}
+
+func processCountText(_ count: Int) -> String {
+    return "\(count) Node process\(count == 1 ? "" : "es")"
+}
+
+func preferredFramework(from processes: [ProcessDisplay]) -> String {
+    if let toolLabel = processes.first(where: { $0.toolLabel != nil })?.toolLabel {
+        return toolLabel
+    }
+
+    let priority = ["Next.js", "Vite", "Astro", "Remix", "Nuxt", "Webpack", "Local server", "npm script", "Nodemon", "Node"]
+    let frameworks = Set(processes.map { $0.framework })
+
+    for framework in priority where frameworks.contains(framework) {
+        return framework
+    }
+
+    return processes.first?.framework ?? "Node"
+}
+
+func preferredCommandSummary(from processes: [ProcessDisplay]) -> String {
+    let summaries = processes.map { $0.commandSummary }
+    let uniqueSummaries = Array(Set(summaries)).sorted()
+
+    if uniqueSummaries.count == 1, let summary = uniqueSummaries.first {
+        return summary
+    }
+
+    let priorityPrefixes = ["npm run", "pnpm", "yarn", "next", "vite", "astro", "remix", "nuxt", "tsx", "nodemon"]
+    for prefix in priorityPrefixes {
+        if let summary = summaries.first(where: { $0.lowercased().hasPrefix(prefix) }) {
+            return summary
+        }
+    }
+
+    return processes.first?.commandSummary ?? "node"
+}
+
+func buildProjectDisplays() -> [ProjectDisplay] {
+    let processDisplays = buildProcessDisplays()
+    var grouped: [String: [ProcessDisplay]] = [:]
+
+    for process in processDisplays {
+        let baseKey = process.projectRoot ?? process.cwd ?? "pid:\(process.process.pid)"
+        let key = process.toolLabel.map { "tool:\($0):\(baseKey)" } ?? baseKey
+        grouped[key, default: []].append(process)
+    }
+
+    return grouped.map { key, group in
+        let processes = group.sorted { $0.process.pid < $1.process.pid }
+        let first = processes[0]
+        let ports = Array(Set(processes.flatMap { $0.ports })).sorted()
+        let toolLabel = first.toolLabel
+
+        return ProjectDisplay(
+            id: key,
+            projectRoot: first.projectRoot,
+            cwd: first.projectRoot ?? first.cwd,
+            projectName: first.projectName,
+            framework: preferredFramework(from: processes),
+            commandSummary: preferredCommandSummary(from: processes),
+            toolLabel: toolLabel,
+            ports: ports,
+            processes: processes
         )
     }
 }
@@ -536,7 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private let processQueue = DispatchQueue(label: "dev.nodesnoop.processes", qos: .utility)
     private var statusItem: NSStatusItem?
-    private var cachedProcesses: [ProcessDisplay] = []
+    private var cachedProjects: [ProjectDisplay] = []
     private var isRefreshing = false
     private var lastRefreshDate: Date?
     private var openAtLoginMessage: String?
@@ -590,23 +760,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return path
     }
 
-    private func portSummary(for process: ProcessDisplay, limit: Int = 3) -> String {
-        let visiblePorts = process.ports.prefix(limit).map { ":\($0)" }
-        let suffix = process.ports.count > limit ? ", ..." : ""
+    private func portSummary(for ports: [Int], limit: Int = 3) -> String {
+        let visiblePorts = ports.prefix(limit).map { ":\($0)" }
+        let suffix = ports.count > limit ? ", ..." : ""
         return visiblePorts.joined(separator: ", ") + suffix
     }
 
-    private func rowTitle(for process: ProcessDisplay) -> String {
-        let project = clipped(process.projectName, limit: 30)
-        let pid = "PID \(process.process.pid)"
+    private func rowTitle(for project: ProjectDisplay) -> String {
+        let projectName = clipped(project.projectName, limit: 34)
+        let count = processCountText(project.processCount)
 
-        if process.isLocalhostProject {
-            let local = "LOCAL \(portSummary(for: process))"
-            return "\(project)  \(local)  \(process.framework)  \(pid)"
+        if project.isDevelopmentTool {
+            let tool = project.toolLabel ?? project.framework
+            return "\(tool)  \(projectName)  \(count)"
         }
 
-        let command = clipped(process.commandSummary, limit: 18)
-        return "\(project)  \(command)  \(pid)"
+        if project.isLocalhostProject {
+            let local = "LOCAL \(portSummary(for: project.ports))"
+            return "\(projectName)  \(local)  \(project.framework)  \(count)"
+        }
+
+        let command = clipped(project.commandSummary, limit: 18)
+        return "\(projectName)  \(command)  \(count)"
+    }
+
+    private func processRowTitle(for process: ProcessDisplay) -> String {
+        let command = clipped(process.commandSummary, limit: 24)
+        return "PID \(process.process.pid)  \(command)"
     }
 
     private func sectionHeader(_ title: String) -> NSMenuItem {
@@ -628,18 +808,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func processCountTitle(_ count: Int, localCount: Int = 0, refreshing: Bool = false) -> String {
-        if refreshing && count == 0 {
+    private func projectCountTitle(_ projectCount: Int, processCount: Int, localCount: Int = 0, toolCount: Int = 0, refreshing: Bool = false) -> String {
+        if refreshing && processCount == 0 {
             return "Refreshing process list..."
         }
 
-        if count == 0 {
+        if processCount == 0 {
             return "No Node.js processes running"
         }
 
-        let processTitle = "\(count) Node.js process\(count == 1 ? "" : "es")"
-        let localTitle = "\(localCount) localhost process\(localCount == 1 ? "" : "es")"
-        let title = localCount > 0 ? "\(processTitle), \(localTitle)" : "\(processTitle) running"
+        let projectTitle = "\(projectCount) project\(projectCount == 1 ? "" : "s")"
+        let nodeTitle = "\(processCount) Node process\(processCount == 1 ? "" : "es")"
+        let localTitle = "\(localCount) localhost project\(localCount == 1 ? "" : "s")"
+        let toolTitle = "\(toolCount) tool\(toolCount == 1 ? "" : "s")"
+        let extras = [
+            localCount > 0 ? localTitle : nil,
+            toolCount > 0 ? toolTitle : nil
+        ].compactMap { $0 }
+        let title = ([projectTitle, nodeTitle] + extras).joined(separator: ", ")
         return refreshing ? "\(title) - refreshing" : title
     }
 
@@ -664,7 +850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderMenu()
 
         processQueue.async { [weak self] in
-            let processes = buildProcessDisplays().sorted {
+            let projects = buildProjectDisplays().sorted {
                 if $0.isLocalhostProject != $1.isLocalhostProject {
                     return $0.isLocalhostProject && !$1.isLocalhostProject
                 }
@@ -674,7 +860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     return nameComparison == .orderedAscending
                 }
 
-                return $0.process.pid < $1.process.pid
+                return ($0.pids.first ?? 0) < ($1.pids.first ?? 0)
             }
 
             DispatchQueue.main.async {
@@ -682,7 +868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     return
                 }
 
-                self.cachedProcesses = processes
+                self.cachedProjects = projects
                 self.lastRefreshDate = Date()
                 self.isRefreshing = false
                 self.renderMenu()
@@ -692,39 +878,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func renderMenu() {
         menu.removeAllItems()
-        let processes = cachedProcesses
-        let localhostProcesses = processes.filter { $0.isLocalhostProject }
-        let otherProcesses = processes.filter { !$0.isLocalhostProject }
+        let projects = cachedProjects
+        let appProjects = projects.filter { !$0.isDevelopmentTool }
+        let localhostProjects = projects.filter { $0.isLocalhostProject }
+        let toolProjects = projects.filter { $0.isDevelopmentTool }
+        let otherProjects = appProjects.filter { !$0.isLocalhostProject }
+        let processCount = projects.reduce(0) { $0 + $1.processCount }
 
         let header = disabledItem("NodeSnoop")
         header.image = makeSpruceTreeIcon()
         menu.addItem(header)
-        menu.addItem(disabledItem(processCountTitle(processes.count, localCount: localhostProcesses.count, refreshing: isRefreshing)))
-        statusItem?.button?.toolTip = "NodeSnoop - \(processCountTitle(processes.count, localCount: localhostProcesses.count))"
+        menu.addItem(disabledItem(projectCountTitle(appProjects.count, processCount: processCount, localCount: localhostProjects.count, toolCount: toolProjects.count, refreshing: isRefreshing)))
+        statusItem?.button?.toolTip = "NodeSnoop - \(projectCountTitle(appProjects.count, processCount: processCount, localCount: localhostProjects.count, toolCount: toolProjects.count))"
         menu.addItem(NSMenuItem.separator())
 
-        if processes.isEmpty && isRefreshing {
-            menu.addItem(sectionHeader("Processes"))
+        if projects.isEmpty && isRefreshing {
+            menu.addItem(sectionHeader("Projects"))
             menu.addItem(disabledItem("Refreshing..."))
-        } else if processes.isEmpty {
-            menu.addItem(sectionHeader("Processes"))
+        } else if projects.isEmpty {
+            menu.addItem(sectionHeader("Projects"))
             menu.addItem(disabledItem("No running Node.js processes"))
         } else {
-            if !localhostProcesses.isEmpty {
+            if !localhostProjects.isEmpty {
                 menu.addItem(sectionHeader("Localhost Projects"))
-                for process in localhostProcesses {
-                    menu.addItem(processMenuItem(for: process))
+                for project in localhostProjects {
+                    menu.addItem(projectMenuItem(for: project))
                 }
             }
 
-            if !localhostProcesses.isEmpty && !otherProcesses.isEmpty {
+            if !localhostProjects.isEmpty && !otherProjects.isEmpty {
                 menu.addItem(NSMenuItem.separator())
             }
 
-            if !otherProcesses.isEmpty {
-                menu.addItem(sectionHeader("Other Node Processes"))
-                for process in otherProcesses {
-                    menu.addItem(processMenuItem(for: process))
+            if !otherProjects.isEmpty {
+                menu.addItem(sectionHeader("Other Projects"))
+                for project in otherProjects {
+                    menu.addItem(projectMenuItem(for: project))
+                }
+            }
+
+            if !toolProjects.isEmpty {
+                if !localhostProjects.isEmpty || !otherProjects.isEmpty {
+                    menu.addItem(NSMenuItem.separator())
+                }
+
+                menu.addItem(sectionHeader("Development Tools"))
+                for project in toolProjects {
+                    menu.addItem(projectMenuItem(for: project))
                 }
             }
         }
@@ -734,7 +934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let killAllItem = NSMenuItem(title: "Kill All Node.js Processes", action: #selector(killAllProcesses(_:)), keyEquivalent: "")
         killAllItem.target = self
-        killAllItem.isEnabled = !processes.isEmpty
+        killAllItem.isEnabled = !projects.isEmpty
         menu.addItem(killAllItem)
 
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refresh(_:)), keyEquivalent: "")
@@ -775,6 +975,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func payload(for project: ProjectDisplay) -> ProjectMenuPayload {
+        return ProjectMenuPayload(
+            pids: project.pids,
+            cwd: project.cwd,
+            url: project.primaryURL
+        )
+    }
+
     private func payload(for process: ProcessDisplay) -> ProcessMenuPayload {
         return ProcessMenuPayload(
             pid: process.process.pid,
@@ -783,27 +991,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
-    private func processMenuItem(for process: ProcessDisplay) -> NSMenuItem {
-        let item = NSMenuItem(title: rowTitle(for: process), action: nil, keyEquivalent: "")
+    private func projectMenuItem(for project: ProjectDisplay) -> NSMenuItem {
+        let item = NSMenuItem(title: rowTitle(for: project), action: nil, keyEquivalent: "")
         let submenu = NSMenu()
-        let itemPayload = payload(for: process)
+        let itemPayload = payload(for: project)
 
-        submenu.addItem(disabledItem(process.projectName))
+        submenu.addItem(disabledItem(project.projectName))
 
-        if process.isLocalhostProject {
-            submenu.addItem(disabledItem("Localhost \(portSummary(for: process))"))
+        if project.isDevelopmentTool {
+            submenu.addItem(disabledItem(project.toolLabel ?? project.framework))
+        } else if project.isLocalhostProject {
+            submenu.addItem(disabledItem("Localhost \(portSummary(for: project.ports))"))
+        } else {
+            submenu.addItem(disabledItem("No detected localhost port"))
         }
 
-        submenu.addItem(disabledItem("\(process.framework) - \(process.commandSummary)"))
+        submenu.addItem(disabledItem("\(project.framework) - \(project.commandSummary)"))
+        submenu.addItem(disabledItem(processCountText(project.processCount)))
 
-        if let cwd = process.projectRoot ?? process.cwd {
+        if let cwd = project.cwd {
             submenu.addItem(disabledItem(clipped(tildePath(cwd), limit: 72)))
         }
 
-        submenu.addItem(disabledItem("PID \(process.process.pid) - Parent \(process.process.ppid) - Status \(process.process.stat)"))
         submenu.addItem(NSMenuItem.separator())
 
-        if process.primaryURL != nil {
+        if project.primaryURL != nil {
             let openLocalhostItem = NSMenuItem(title: "Open Localhost", action: #selector(openLocalhost(_:)), keyEquivalent: "")
             openLocalhostItem.target = self
             openLocalhostItem.representedObject = itemPayload
@@ -827,12 +1039,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             submenu.addItem(copyPathItem)
         }
 
+        let copyPIDsItem = NSMenuItem(title: "Copy Process IDs", action: #selector(copyProjectPIDs(_:)), keyEquivalent: "")
+        copyPIDsItem.target = self
+        copyPIDsItem.representedObject = itemPayload
+        submenu.addItem(copyPIDsItem)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let stopTitle = project.isDevelopmentTool ? "Stop Tool Processes" : "Stop Project"
+        let stopItem = NSMenuItem(title: stopTitle, action: #selector(stopProject(_:)), keyEquivalent: "")
+        stopItem.target = self
+        stopItem.representedObject = itemPayload
+        submenu.addItem(stopItem)
+
+        submenu.addItem(NSMenuItem.separator())
+        submenu.addItem(sectionHeader("Processes"))
+
+        for process in project.processes {
+            submenu.addItem(processDetailMenuItem(for: process))
+        }
+
+        item.submenu = submenu
+        item.toolTip = project.cwd.map(tildePath) ?? project.projectName
+        return item
+    }
+
+    private func processDetailMenuItem(for process: ProcessDisplay) -> NSMenuItem {
+        let item = NSMenuItem(title: processRowTitle(for: process), action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let itemPayload = payload(for: process)
+
+        submenu.addItem(disabledItem("PID \(process.process.pid)"))
+        submenu.addItem(disabledItem("Parent PID \(process.process.ppid) - Status \(process.process.stat)"))
+        submenu.addItem(disabledItem(clipped(normalized(commandText(for: process.process)), limit: 78)))
+        submenu.addItem(NSMenuItem.separator())
+
         let copyItem = NSMenuItem(title: "Copy PID", action: #selector(copyProcessPID(_:)), keyEquivalent: "")
         copyItem.target = self
         copyItem.representedObject = itemPayload
         submenu.addItem(copyItem)
-
-        submenu.addItem(NSMenuItem.separator())
 
         let killItem = NSMenuItem(title: "Kill Process", action: #selector(killMenuItemProcess(_:)), keyEquivalent: "")
         killItem.target = self
@@ -850,8 +1095,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openLocalhost(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? ProcessMenuPayload,
-              let urlString = payload.url,
+        let urlString: String?
+        if let projectPayload = sender.representedObject as? ProjectMenuPayload {
+            urlString = projectPayload.url
+        } else if let processPayload = sender.representedObject as? ProcessMenuPayload {
+            urlString = processPayload.url
+        } else {
+            urlString = nil
+        }
+
+        guard let urlString,
               let url = URL(string: urlString) else {
             NSSound.beep()
             return
@@ -861,12 +1114,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openProcessTerminal(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? ProcessMenuPayload else {
-            return
+        let pid: Int?
+        let cachedCwd: String?
+
+        if let projectPayload = sender.representedObject as? ProjectMenuPayload {
+            pid = projectPayload.pids.first
+            cachedCwd = projectPayload.cwd
+        } else if let processPayload = sender.representedObject as? ProcessMenuPayload {
+            pid = processPayload.pid
+            cachedCwd = processPayload.cwd
+        } else {
+            pid = nil
+            cachedCwd = nil
         }
 
-        let pid = payload.pid
-        let cachedCwd = payload.cwd
+        guard let pid else {
+            NSSound.beep()
+            return
+        }
 
         processQueue.async {
             guard let cwd = cachedCwd ?? processCwd(pid: pid) else {
@@ -881,8 +1146,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func copyLocalhostURL(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? ProcessMenuPayload,
-              let url = payload.url else {
+        let url: String?
+        if let projectPayload = sender.representedObject as? ProjectMenuPayload {
+            url = projectPayload.url
+        } else if let processPayload = sender.representedObject as? ProcessMenuPayload {
+            url = processPayload.url
+        } else {
+            url = nil
+        }
+
+        guard let url else {
             return
         }
 
@@ -890,12 +1163,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func copyProjectPath(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? ProcessMenuPayload,
-              let cwd = payload.cwd else {
+        let cwd: String?
+        if let projectPayload = sender.representedObject as? ProjectMenuPayload {
+            cwd = projectPayload.cwd
+        } else if let processPayload = sender.representedObject as? ProcessMenuPayload {
+            cwd = processPayload.cwd
+        } else {
+            cwd = nil
+        }
+
+        guard let cwd else {
             return
         }
 
         copyToPasteboard(cwd)
+    }
+
+    @objc private func copyProjectPIDs(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProjectMenuPayload else {
+            return
+        }
+
+        copyToPasteboard(payload.pids.map(String.init).joined(separator: " "))
     }
 
     @objc private func copyProcessPID(_ sender: NSMenuItem) {
@@ -912,7 +1201,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let pid = payload.pid
-        cachedProcesses.removeAll { $0.process.pid == pid }
+        cachedProjects = cachedProjects.compactMap { project in
+            let remainingProcesses = project.processes.filter { $0.process.pid != pid }
+            if remainingProcesses.isEmpty {
+                return nil
+            }
+
+            let remainingPorts = Array(Set(remainingProcesses.flatMap { $0.ports })).sorted()
+            return ProjectDisplay(
+                id: project.id,
+                projectRoot: project.projectRoot,
+                cwd: project.cwd,
+                projectName: project.projectName,
+                framework: preferredFramework(from: remainingProcesses),
+                commandSummary: preferredCommandSummary(from: remainingProcesses),
+                toolLabel: project.toolLabel,
+                ports: remainingPorts,
+                processes: remainingProcesses
+            )
+        }
         renderMenu()
 
         processQueue.async { [weak self] in
@@ -924,9 +1231,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func stopProject(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProjectMenuPayload else {
+            return
+        }
+
+        let pids = payload.pids
+        cachedProjects.removeAll { project in
+            !Set(project.pids).isDisjoint(with: pids)
+        }
+        renderMenu()
+
+        processQueue.async { [weak self] in
+            for pid in pids {
+                killProcess(pid: pid)
+            }
+
+            DispatchQueue.main.async {
+                self?.refreshProcesses(force: true)
+            }
+        }
+    }
+
     @objc private func killAllProcesses(_ sender: NSMenuItem) {
-        let pids = cachedProcesses.map { $0.process.pid }
-        cachedProcesses = []
+        let pids = cachedProjects.flatMap { $0.pids }
+        cachedProjects = []
         renderMenu()
 
         processQueue.async { [weak self] in
